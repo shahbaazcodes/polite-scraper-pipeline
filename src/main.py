@@ -1,9 +1,10 @@
 """
-Polite Scraper Pipeline - Stage 3: Extract Raw Book Details
+Polite Scraper Pipeline - Stage 4: Clean, Validate, and Store Records
 Target: https://books.toscrape.com
 """
 
 from datetime import datetime, timezone
+import json
 import logging
 from pathlib import Path
 import re
@@ -11,6 +12,8 @@ import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
+
+from pydantic import BaseModel, HttpUrl, Field, ValidationError
 import requests
 
 # Setup structured logging
@@ -24,17 +27,29 @@ logger = logging.getLogger("PoliteScraper")
 # Pipeline Configuration
 START_URL = "https://books.toscrape.com/catalogue/page-1.html"
 CACHE_DIR = Path("cache")
+OUTPUT_DIR = Path("output")
 USER_AGENT = "FlyRankInternship-A9/1.0 (+https://github.com/shahbaazcodes/polite-scraper-pipeline)"
 REQUEST_TIMEOUT = 10.0  # seconds
 POLITE_DELAY_SECONDS = 0.5  # 500ms delay between live network requests
 MAX_CATALOGUE_PAGES = 3
 
 
+# --- Pydantic v2 Validation Schema ---
+class BookRecord(BaseModel):
+    """Normalized and strictly validated schema for a book entity."""
+    title: str = Field(..., min_length=1, description="Full title of the book")
+    product_url: HttpUrl = Field(..., description="Canonical absolute URL of the product page")
+    price_text: str = Field(..., description="Raw price string extracted from HTML")
+    price_gbp: float = Field(..., ge=0.0, description="Parsed numerical price in GBP")
+    availability_text: str = Field(..., description="Raw stock availability text")
+    rating_text: str = Field(..., description="Textual rating representation")
+    description: Optional[str] = Field(None, description="Book description if present")
+    source_page: HttpUrl = Field(..., description="Catalogue URL where link was discovered")
+    fetched_at: str = Field(..., description="ISO 8601 UTC timestamp of fetch")
+
+
 def fetch_and_cache_page(url: str, cache_filename: str) -> str:
-    """
-    Politely fetches an HTML page with a 500ms delay for uncached requests,
-    a custom User-Agent, and strict timeout checking.
-    """
+    """Politely fetches an HTML page with a 500ms delay for uncached requests."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = CACHE_DIR / cache_filename
 
@@ -97,10 +112,9 @@ def discover_book_entries(start_url: str, max_pages: int = MAX_CATALOGUE_PAGES) 
         page_count += 1
         cache_filename = f"catalogue-page-{page_count}.html"
         
-        logger.info(f"Processing Catalogue Page {page_count}/{max_pages}: {current_url}")
         html_content = fetch_and_cache_page(current_url, cache_filename)
-        
         page_book_urls = extract_book_urls(html_content, current_url)
+        
         for book_url in page_book_urls:
             discovered_entries.append({
                 "product_url": book_url,
@@ -120,26 +134,27 @@ def discover_book_entries(start_url: str, max_pages: int = MAX_CATALOGUE_PAGES) 
     return unique_entries
 
 
+def normalize_price(price_text: str) -> float:
+    """Extracts floating point number from messy price string like 'Â£51.77'."""
+    match = re.search(r"(\d+\.\d+)", price_text)
+    if match:
+        return float(match.group(1))
+    raise ValueError(f"Could not parse numeric price from: '{price_text}'")
+
+
 def extract_raw_book_detail(html_content: str, product_url: str, source_page: str) -> Dict[str, Any]:
-    """
-    Parses product details from raw HTML, targeting specific product containers.
-    Returns 8 raw fields including provenance metadata[cite: 7].
-    """
+    """Parses product details from raw HTML."""
     soup = BeautifulSoup(html_content, "html.parser")
     main_pod = soup.select_one("div.product_main")
 
-    # 1. Title
     title = main_pod.select_one("h1").text.strip() if main_pod and main_pod.select_one("h1") else ""
 
-    # 2. Price Text
     price_tag = main_pod.select_one("p.price_color") if main_pod else None
     price_text = price_tag.text.strip() if price_tag else ""
 
-    # 3. Availability Text
     availability_tag = main_pod.select_one("p.instock.availability") if main_pod else None
     availability_text = " ".join(availability_tag.text.split()) if availability_tag else ""
 
-    # 4. Rating Text (e.g. class="star-rating Three")
     rating_text = ""
     rating_tag = main_pod.select_one("p.star-rating") if main_pod else None
     if rating_tag:
@@ -148,7 +163,6 @@ def extract_raw_book_detail(html_content: str, product_url: str, source_page: st
         if rating_classes:
             rating_text = rating_classes[0]
 
-    # 5. Description (Optional field - store None if missing, never invent text)[cite: 7]
     description: Optional[str] = None
     desc_header = soup.find("div", id="product_description")
     if desc_header:
@@ -156,7 +170,6 @@ def extract_raw_book_detail(html_content: str, product_url: str, source_page: st
         if desc_paragraph:
             description = desc_paragraph.text.strip()
 
-    # Provenance timestamp[cite: 7]
     fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     return {
@@ -171,38 +184,67 @@ def extract_raw_book_detail(html_content: str, product_url: str, source_page: st
     }
 
 
-def extract_all_raw_records() -> List[Dict[str, Any]]:
-    """Fetches and extracts raw records for all 60 discovered books[cite: 7]."""
+def process_and_store_records():
+    """Fetches, normalizes, validates against schema, and writes clean records to output/books.json."""
     entries = discover_book_entries(START_URL, max_pages=MAX_CATALOGUE_PAGES)
-    raw_records: List[Dict[str, Any]] = []
+    validated_records: List[Dict[str, Any]] = []
+    error_records: List[Dict[str, Any]] = []
 
-    logger.info(f"Starting detail page extraction for {len(entries)} books...")
+    logger.info(f"Normalizing and validating {len(entries)} records...")
 
     for idx, entry in enumerate(entries, start=1):
         product_url = entry["product_url"]
         source_page = entry["source_page"]
         
-        # Derive a safe cache filename from book URL
         url_slug = re.sub(r"[^a-zA-Z0-9-]", "_", product_url.split("/")[-2])
         cache_filename = f"detail-{idx:02d}-{url_slug}.html"
 
         html_content = fetch_and_cache_page(product_url, cache_filename)
         raw_record = extract_raw_book_detail(html_content, product_url, source_page)
-        raw_records.append(raw_record)
 
-    print("\n--- STAGE 3 CHECKPOINT SUMMARY ---")
-    print(f"detail_pages = {len(raw_records)}")
-    print("Sample Raw Record (Book #1):")
-    import json
-    print(json.dumps(raw_records[0], indent=2))
+        try:
+            # 1. Normalize price text to float numeric GBP
+            price_gbp = normalize_price(raw_record["price_text"])
+            
+            # Combine raw record with normalized field
+            full_record = {**raw_record, "price_gbp": price_gbp}
+
+            # 2. Validate against Pydantic schema
+            validated_model = BookRecord(**full_record)
+            
+            # Dump back to dictionary with serializable types (HttpUrl -> str)
+            validated_records.append(validated_model.model_dump(mode="json"))
+
+        except (ValueError, ValidationError) as err:
+            logger.warning(f"Schema validation failed for {product_url}: {err}")
+            error_records.append({
+                "product_url": product_url,
+                "error": str(err),
+                "raw_record": raw_record
+            })
+
+    # Save outputs idempotently
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    books_file = OUTPUT_DIR / "books.json"
+    errors_file = OUTPUT_DIR / "errors.json"
+
+    books_file.write_text(json.dumps(validated_records, indent=2), encoding="utf-8")
+    errors_file.write_text(json.dumps(error_records, indent=2), encoding="utf-8")
+
+    print("\n--- STAGE 4 CHECKPOINT SUMMARY ---")
+    print(f"validated_records = {len(validated_records)}")
+    print(f"error_records = {len(error_records)}")
+    print(f"Output written to: {books_file}")
+    if validated_records:
+        sample = validated_records[0]
+        print(f"Sample price_gbp: {sample['price_gbp']} (type: {type(sample['price_gbp']).__name__})")
+        print(f"Sample URL: {sample['product_url']}")
     print("-----------------------------------\n")
-
-    return raw_records
 
 
 def main():
-    logger.info("Initializing Stage 3 Execution...")
-    extract_all_raw_records()
+    logger.info("Initializing Stage 4 Execution...")
+    process_and_store_records()
 
 
 if __name__ == "__main__":
