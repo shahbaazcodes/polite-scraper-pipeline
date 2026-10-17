@@ -1,14 +1,18 @@
 """
-Polite Scraper Pipeline - Stage 5: Fault Tolerance, Single-Retry Logic, and Run Reporting
+Polite Scraper Pipeline - Production Pipeline with Extras & Fault Tolerance
 Target: https://books.toscrape.com
 """
 
+import csv
+
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 from pathlib import Path
 import re
 import time
+from urllib.parse import urljoin
 
 from pydantic import BaseModel, HttpUrl, Field, ValidationError
 import requests
@@ -45,11 +49,14 @@ class BookRecord(BaseModel):
     fetched_at: str = Field(..., description="ISO 8601 UTC timestamp of fetch")
 
 
+def compute_record_hash(record: dict) -> str:
+    """Computes an SHA256 hash of core content fields to detect payload changes across runs."""
+    content_str = f"{record['title']}|{record['price_gbp']}|{record['availability_text']}|{record['rating_text']}"
+    return hashlib.sha256(content_str.encode("utf-8")).hexdigest()
+
+
 def fetch_and_cache_page(url: str, cache_filename: str, metrics: dict) -> str | None:
-    """
-    Politely fetches an HTML page with single-retry logic for transient errors (5xx/timeouts),
-    skipping non-retriable client errors (404/403).
-    """
+    """Politely fetches an HTML page with single-retry logic for transient errors (5xx/timeouts)."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = CACHE_DIR / cache_filename
 
@@ -68,7 +75,6 @@ def fetch_and_cache_page(url: str, cache_filename: str, metrics: dict) -> str | 
         try:
             response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
             
-            # 404/403 are client errors; do not retry
             if response.status_code in (404, 403):
                 logger.error(f"Client error {response.status_code} for {url}. Skipping.")
                 metrics["failed_pages"] += 1
@@ -99,7 +105,7 @@ def fetch_and_cache_page(url: str, cache_filename: str, metrics: dict) -> str | 
 
 
 def extract_book_urls(html_content: str, current_page_url: str) -> list[str]:
-    """Extracts product page links from a catalogue page and resolves absolute URLs."""
+    """Extracts product page links from catalogue page and resolves absolute URLs."""
     soup = BeautifulSoup(html_content, "html.parser")
     book_urls: list[str] = []
 
@@ -107,7 +113,6 @@ def extract_book_urls(html_content: str, current_page_url: str) -> list[str]:
     for article in articles:
         link_tag = article.select_one("h3 > a")
         if link_tag and "href" in link_tag.attrs:
-            from urllib.parse import urljoin
             relative_href = str(link_tag["href"])
             absolute_url = urljoin(current_page_url, relative_href)
             book_urls.append(absolute_url)
@@ -116,17 +121,16 @@ def extract_book_urls(html_content: str, current_page_url: str) -> list[str]:
 
 
 def extract_next_page_url(html_content: str, current_page_url: str) -> str | None:
-    """Finds the pagination 'next' link from the catalogue page if present."""
+    """Finds pagination 'next' link from catalogue page."""
     soup = BeautifulSoup(html_content, "html.parser")
     next_tag = soup.select_one("li.next > a")
     if next_tag and "href" in next_tag.attrs:
-        from urllib.parse import urljoin
         return urljoin(current_page_url, str(next_tag["href"]))
     return None
 
 
 def discover_book_entries(start_url: str, metrics: dict, max_pages: int = MAX_CATALOGUE_PAGES) -> list[dict[str, str]]:
-    """Crawls catalogue pages sequentially, storing product URLs with source page provenance."""
+    """Crawls catalogue pages sequentially."""
     discovered_entries: list[dict[str, str]] = []
     current_url: str | None = start_url
     page_count = 0
@@ -149,7 +153,6 @@ def discover_book_entries(start_url: str, metrics: dict, max_pages: int = MAX_CA
 
         current_url = extract_next_page_url(html_content, current_url)
 
-    # Deduplicate while preserving order
     unique_entries = []
     seen_urls = set()
     for entry in discovered_entries:
@@ -157,19 +160,18 @@ def discover_book_entries(start_url: str, metrics: dict, max_pages: int = MAX_CA
             seen_urls.add(entry["product_url"])
             unique_entries.append(entry)
 
-    # Inject one synthetic broken URL to prove fault tolerance without hammering the target site
+    # Injected broken entry for resilience check
     test_broken_entry = {
         "product_url": "https://books.toscrape.com/catalogue/non_existent_broken_book_9999/index.html",
         "source_page": start_url
     }
     unique_entries.append(test_broken_entry)
-    logger.info("Injected 1 intentional broken URL into discovery queue for Stage 5 resilience verification.")
 
     return unique_entries
 
 
 def normalize_price(price_text: str) -> float:
-    """Extracts floating point number from messy price string."""
+    """Extracts float price from string."""
     match = re.search(r"(\d+\.\d+)", price_text)
     if match:
         return float(match.group(1))
@@ -182,7 +184,6 @@ def extract_raw_book_detail(html_content: str, product_url: str, source_page: st
     main_pod = soup.select_one("div.product_main")
 
     title = main_pod.select_one("h1").text.strip() if main_pod and main_pod.select_one("h1") else ""
-
     price_tag = main_pod.select_one("p.price_color") if main_pod else None
     price_text = price_tag.text.strip() if price_tag else ""
 
@@ -218,8 +219,23 @@ def extract_raw_book_detail(html_content: str, product_url: str, source_page: st
     }
 
 
+def export_to_csv(records: list[dict], filepath: Path):
+    """Exports validated records to a clean CSV file."""
+    if not records:
+        return
+    fieldnames = list(records[0].keys())
+    fieldnames.append("content_hash")
+
+    with open(filepath, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for rec in records:
+            row = {**rec, "content_hash": compute_record_hash(rec)}
+            writer.writerow(row)
+
+
 def run_pipeline():
-    """Runs the full pipeline, isolating bad pages and writing output/run-report.json[cite: 8]."""
+    """Runs pipeline, exporting JSON, CSV, and change detection metrics."""
     start_time_utc = datetime.now(timezone.utc)
     start_timestamp = start_time_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -231,13 +247,23 @@ def run_pipeline():
         "valid_records": 0,
         "invalid_records": 0,
         "failed_pages": 0,
+        "delta_summary": {"new": 0, "unchanged": 0}
     }
+
+    # Load existing books for change detection
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    books_file = OUTPUT_DIR / "books.json"
+    previous_hashes = {}
+    if books_file.exists():
+        try:
+            prev_data = json.loads(books_file.read_text(encoding="utf-8"))
+            previous_hashes = {item["product_url"]: compute_record_hash(item) for item in prev_data}
+        except Exception:
+            previous_hashes = {}
 
     entries = discover_book_entries(START_URL, metrics, max_pages=MAX_CATALOGUE_PAGES)
     validated_records = []
     error_records = []
-
-    logger.info(f"Processing detail extraction for {len(entries)} queued entries...")
 
     for idx, entry in enumerate(entries, start=1):
         product_url = entry["product_url"]
@@ -247,10 +273,7 @@ def run_pipeline():
         cache_filename = f"detail-{idx:02d}-{url_slug}.html"
 
         html_content = fetch_and_cache_page(product_url, cache_filename, metrics)
-        
-        # If fetch failed (e.g. 404 broken page), log and skip without taking down the run[cite: 8]
         if not html_content:
-            logger.warning(f"Skipping record extraction for unresolvable URL: {product_url}")
             continue
 
         try:
@@ -259,38 +282,44 @@ def run_pipeline():
             full_record = {**raw_record, "price_gbp": price_gbp}
 
             validated_model = BookRecord(**full_record)
-            validated_records.append(validated_model.model_dump(mode="json"))
+            dumped_record = validated_model.model_dump(mode="json")
+            validated_records.append(dumped_record)
             metrics["valid_records"] += 1
+
+            # Delta tracking
+            rec_hash = compute_record_hash(dumped_record)
+            if product_url in previous_hashes and previous_hashes[product_url] == rec_hash:
+                metrics["delta_summary"]["unchanged"] += 1
+            else:
+                metrics["delta_summary"]["new"] += 1
 
         except (ValueError, ValidationError) as err:
             logger.warning(f"Validation failed for {product_url}: {err}")
-            error_records.append({
-                "product_url": product_url,
-                "error": str(err)
-            })
+            error_records.append({"product_url": product_url, "error": str(err)})
             metrics["invalid_records"] += 1
 
-    # End execution timer
     end_time_utc = datetime.now(timezone.utc)
     metrics["duration_seconds"] = round((end_time_utc - start_time_utc).total_seconds(), 2)
 
-    # Save outputs idempotently[cite: 8]
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    books_file = OUTPUT_DIR / "books.json"
+    # Export artifacts
+    csv_file = OUTPUT_DIR / "books.csv"
     errors_file = OUTPUT_DIR / "errors.json"
     report_file = OUTPUT_DIR / "run-report.json"
 
     books_file.write_text(json.dumps(validated_records, indent=2), encoding="utf-8")
     errors_file.write_text(json.dumps(error_records, indent=2), encoding="utf-8")
     report_file.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    export_to_csv(validated_records, csv_file)
 
-    print("\n--- STAGE 5 CHECKPOINT RUN REPORT ---")
+    print("\n--- PIPELINE EXECUTION SUMMARY ---")
     print(json.dumps(metrics, indent=2))
-    print("-------------------------------------\n")
+    print(f"JSON Export: {books_file}")
+    print(f"CSV Export:  {csv_file}")
+    print("----------------------------------\n")
 
 
 def main():
-    logger.info("Initializing Stage 5 Execution...")
+    logger.info("Initializing Pipeline Execution...")
     run_pipeline()
 
 
