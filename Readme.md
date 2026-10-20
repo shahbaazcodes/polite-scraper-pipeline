@@ -65,8 +65,8 @@ An AI-generated scraper was prompted and generated in quarantine at `ai-version/
 * **Custom Implementation:** Implements local `cache/` storage, custom header identification, and a mandatory `500ms` rate-limit delay[cite: 6, 7, 10].
 
 ### 3. Data Validation & Error Recovery
-* **AI Implementation:** Relied on raw string slicing for currency formatting (`replace("£", "")`), which fails on non-standard encoding like `Â£51.77`[cite: 8, 10]. Unhandled page errors or missing fields crash the script[cite: 8, 10].
-* **Custom Implementation:** Uses regex-based currency parsing, Pydantic v2 schema validation, single-retry transient error handling, and isolates broken pages without taking down the pipeline[cite: 8, 10].
+* **AI Implementation:** Relied on raw string slicing for currency formatting (`replace("£", "")`), which fails on non-standard encoding like `Â£51.77`. Unhandled page errors or missing fields crash the script[cite: 8, 10].
+* **Custom Implementation:** Uses regex-based currency parsing, Pydantic v2 schema validation, single-retry transient error handling, and isolates broken pages without taking down the pipeline.
 
 ---
 
