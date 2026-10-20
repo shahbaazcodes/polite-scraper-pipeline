@@ -2,7 +2,7 @@
 
 A production-grade, fault-tolerant web scraping and ETL ingestion pipeline built with **Python 3.10+**, **Requests**, **BeautifulSoup4**, and **Pydantic v2**[cite: 5].
 
-This project collects product metadata across 60 books on a practice sandbox, normalizes messy raw text into typed models, enforces strict schema validation, exports both JSON and CSV payloads, survives broken pages without crashing, and generates structured execution metrics[cite: 4, 8, 9].
+This project collects product metadata across 60 books on a practice sandbox, normalizes messy raw text into typed models, enforces strict schema validation, exports both JSON and CSV payloads, survives broken pages without crashing, and generates structured execution metrics[cite: 4, 8, 9]..
 
 ---
 
